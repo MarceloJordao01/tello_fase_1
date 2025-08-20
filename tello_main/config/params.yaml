@@ -1,0 +1,26 @@
+tello_navigator:
+  ros__parameters:
+    ns_abs: "/drone1"
+
+    map_frame: "map"
+    base_link_frame: "base_link_1"
+
+    takeoff_height_m: 0.5
+
+    auto_takeoff: true
+    auto_start: true
+    require_start_service: true
+    speed_cmps: 20
+    debug: true
+
+    hold_after_takeoff_s: 1.0
+    hold_between_waypoints_s: 0.0
+
+    probe_child_frame: "camera_link_1"
+    wait_for_base_link_timeout_s: 15.0
+
+    # Cada item: "[dx, dy, dz, speed, delay_s]"
+    waypoints_list:
+      - "[20, 0, 0, 20, 0.5]"
+      - "[0, 20, 0, 20, 0.5]"
+      - "[0, 0, 20, 15, 1.0]"
