@@ -1,0 +1,4 @@
+[submodule "base_detection"]
+    path = base_detection
+    url = https://github.com/MarceloJordao01/base_detection.git
+    branch = feat/tello_fase_1

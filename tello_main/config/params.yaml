@@ -13,7 +13,7 @@ tello_navigator:
     speed_cmps: 20
     debug: true
 
-    hold_after_takeoff_s: 1.0
+    hold_after_takeoff_s: 5.0
     hold_between_waypoints_s: 0.0
 
     probe_child_frame: "camera_link_1"
@@ -21,6 +21,19 @@ tello_navigator:
 
     # Cada item: "[dx, dy, dz, speed, delay_s]"
     waypoints_list:
-      - "[20, 0, 0, 20, 0.5]"
-      - "[0, 20, 0, 20, 0.5]"
-      - "[0, 0, 20, 15, 1.0]"
+      - "[85, 60, 260, 20, 3.0]" # primeira tf (1x,1y)
+      - "[160, 0, 0, 20, 4.0]" # casa 2x1y
+      - "[160, 0, 0, 20, 4.0]" # casa 3x1y
+      - "[160, 0, 0, 20, 4.0]" # casa 4x1y
+      - "[0, 160, 0, 20, 4.0]" # casa 4x2y
+      - "[-160, 0, 0, 20, 4.0]" # casa 3x2y
+      - "[-160, 0, 0, 20, 4.0]" # casa 2x2y
+      - "[-160, 0, 0, 20, 4.0]" # casa 1x2y
+      - "[0, 160, 0, 20, 4.0]" # casa 1x3y
+      - "[160, 0, 0, 20, 4.0]" # casa 2x3y
+      - "[160, 0, 0, 20, 4.0]" # casa 3x3y
+      - "[160, 0, 0, 20, 4.0]" # casa 4x3y
+      - "[0, 160, 0, 20, 4.0]" # casa 4x4y
+      - "[-160, 0, 0, 20, 4.0]" # casa 3x4y
+      - "[-160, 0, 0, 20, 4.0]" # casa 2x4y
+      - "[-160, 0, 0, 20, 4.0]" # casa 1x4y
