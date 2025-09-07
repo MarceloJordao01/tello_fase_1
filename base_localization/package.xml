@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>base_localization</name>
+  <version>0.0.2</version>
+  <description>Estima a pose 6D das bases (1m x 1m) relativas ao drone usando PnP, lendo intrínsecos da câmera a partir de YAML.</description>
+  <maintainer email="seu_email@exemplo.com">Seu Nome</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
