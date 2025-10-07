@@ -31,6 +31,7 @@ setup(
     entry_points={
         'console_scripts': [
             'navigator = tello_main.navigator_node:main',
+            'land_bases_pose_publisher = tello_main.land_bases_pose_publisher:main'
         ],
     },
 )

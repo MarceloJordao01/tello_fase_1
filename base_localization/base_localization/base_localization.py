@@ -1,277 +1,351 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import numpy as np
-import cv2
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+from rclpy.time import Time
+from rclpy.duration import Duration
 
-from std_msgs.msg import Float32MultiArray
-from geometry_msgs.msg import Pose, PoseStamped, TransformStamped
+from std_msgs.msg import Float32MultiArray, Int32
+from geometry_msgs.msg import Point, Pose, PoseArray, Quaternion, PointStamped
+from visualization_msgs.msg import Marker
+from std_srvs.srv import Trigger
 
 import tf2_ros
-import tf2_geometry_msgs  # registra conversões para Buffer.transform
+from tf2_ros import TransformException
 
 
-def rotmat_to_quaternion(R: np.ndarray) -> Tuple[float, float, float, float]:
-    """Converte matriz 3x3 em quaternion (x, y, z, w) sem libs extras."""
-    m00, m01, m02 = R[0, 0], R[0, 1], R[0, 2]
-    m10, m11, m12 = R[1, 0], R[1, 1], R[1, 2]
-    m20, m21, m22 = R[2, 0], R[2, 1], R[2, 2]
-    tr = m00 + m11 + m22
-
-    if tr > 0.0:
-        S = np.sqrt(tr + 1.0) * 2.0
-        qw = 0.25 * S
-        qx = (m21 - m12) / S
-        qy = (m02 - m20) / S
-        qz = (m10 - m01) / S
-    elif (m00 > m11) and (m00 > m22):
-        S = np.sqrt(1.0 + m00 - m11 - m22) * 2.0
-        qw = (m21 - m12) / S
-        qx = 0.25 * S
-        qy = (m01 + m10) / S
-        qz = (m02 + m20) / S
-    elif m11 > m22:
-        S = np.sqrt(1.0 + m11 - m00 - m22) * 2.0
-        qw = (m02 - m20) / S
-        qx = (m01 + m10) / S
-        qy = 0.25 * S
-        qz = (m12 + m21) / S
-    else:
-        S = np.sqrt(1.0 + m22 - m00 - m11) * 2.0
-        qw = (m10 - m01) / S
-        qx = (m02 + m20) / S
-        qy = (m12 + m21) / S
-        qz = 0.25 * S
-
-    q = np.array([qx, qy, qz, qw], dtype=np.float64)
-    q /= np.linalg.norm(q)
-    return float(q[0]), float(q[1]), float(q[2]), float(q[3])
+# ---------------- QoS helpers ----------------
+def make_qos_sensor(reliable: bool) -> QoSProfile:
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=10,
+    )
 
 
-def rvec_tvec_to_pose(rvec: np.ndarray, tvec: np.ndarray) -> Pose:
-    """Converte (rvec,tvec) do OpenCV em geometry_msgs/Pose (no frame da câmera)."""
-    R, _ = cv2.Rodrigues(rvec)
-    qx, qy, qz, qw = rotmat_to_quaternion(R)
-    px, py, pz = tvec.flatten().tolist()
-
-    pose = Pose()
-    pose.position.x = float(px)
-    pose.position.y = float(py)
-    pose.position.z = float(pz)
-    pose.orientation.x = float(qx)
-    pose.orientation.y = float(qy)
-    pose.orientation.z = float(qz)
-    pose.orientation.w = float(qw)
-    return pose
+def make_qos_marker() -> QoSProfile:
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=50,
+    )
 
 
-class BaseLocalization(Node):
+def make_qos_status() -> QoSProfile:
+    return QoSProfile(
+        reliability=ReliabilityPolicy.RELIABLE,
+        durability=DurabilityPolicy.VOLATILE,
+        history=HistoryPolicy.KEEP_LAST,
+        depth=10,
+    )
+
+
+class BaseLocalizationNode(Node):
     """
-    - Lê K/D da câmera via YAML.
-    - Assina bboxes 2D (Float32MultiArray [x1,y1,x2,y2,score,...]).
-    - Estima pose da base (quadrado 1x1m) com PnP.
-    - Mantém e publica TF contínua por base como filho de 'drone_frame':
-        map -> base_link_1 (seu TF) -> base_target_i (publicado aqui)
+    Fluxo:
+      - Assina /base_detection/detected_coords (Float32MultiArray) e guarda o último lote.
+      - No callback de detecção:
+          * Lê TF (reference_frame <- target_frame). Se disponível, para cada bbox:
+              cx=(x1+x2)/2, cy=(y1+y2)/2
+              dx = -cx + 48
+              dy = -cy + 480
+              P0 = TF(target_frame) em reference_frame
+              P1 = P0 + K*(dx,dy,0)   (z de P1 = 0)
+          * Publica um PointStamped (frame = reference_frame) por bbox em /base_localization/points.
+          * Publica /base_detection/num_bases (Int32).
+      - Serviço /base_localization/update_markers (Trigger):
+          * Apenas desenha/atualiza os Markers LINE_STRIP [P0,P1] por bbox (id = índice),
+            e (opcional) publica PoseArray com todos P1.
+      - Serviço /base_localization/clear_markers (Trigger) para remover markers.
+
+    Importante: lifetime padrão do Marker é 0.0 (infinito) para manter visível no RViz após o serviço.
     """
 
-    def __init__(self):
-        super().__init__('base_localization')
+    def __init__(self) -> None:
+        super().__init__("base_localization")
 
-        # ---------- Parâmetros ----------
-        self.declare_parameter('detected_coords_topic', '/base_detection/detected_coords')
-        self.declare_parameter('camera_frame', 'espcam_link_1')
-        self.declare_parameter('drone_frame', 'base_link_1')
-        self.declare_parameter('square_size_m', 1.0)
-        self.declare_parameter('min_score', 0.25)
-        self.declare_parameter('tf_child_prefix', 'base_target_')
-        self.declare_parameter('tf_publish_rate_hz', 20.0)
+        # ---------------- Parâmetros ----------------
+        self.declare_parameter("detection_topic", "/base_detection/detected_coords")
+        self.declare_parameter("num_bases_topic", "/base_detection/num_bases")
 
-        # intrínsecos
-        self.declare_parameter('camera.K', [600.0, 0.0, 320.0,
-                                            0.0, 600.0, 240.0,
-                                            0.0,   0.0,   1.0])
-        self.declare_parameter('camera.D', [0.0, 0.0, 0.0, 0.0, 0.0])
+        self.declare_parameter("reference_frame", "map")
+        self.declare_parameter("target_frame", "base_link_1")
+        self.declare_parameter("tf_timeout_sec", 0.2)
 
-        # leitura
-        self.detected_coords_topic = self.get_parameter('detected_coords_topic').get_parameter_value().string_value
-        self.camera_frame = self.get_parameter('camera_frame').get_parameter_value().string_value
-        self.drone_frame = self.get_parameter('drone_frame').get_parameter_value().string_value
-        self.square_size = float(self.get_parameter('square_size_m').get_parameter_value().double_value)
-        self.min_score = float(self.get_parameter('min_score').get_parameter_value().double_value)
-        self.tf_child_prefix = self.get_parameter('tf_child_prefix').get_parameter_value().string_value
-        self.tf_publish_rate_hz = float(self.get_parameter('tf_publish_rate_hz').get_parameter_value().double_value)
+        # QoS/assinatura das detecções
+        self.declare_parameter("detection_qos_reliable", True)
 
-        K_list = list(self.get_parameter('camera.K').get_parameter_value().double_array_value)
-        if len(K_list) != 9:
-            raise RuntimeError("camera.K deve ter 9 valores (fx,0,cx, 0,fy,cy, 0,0,1).")
-        self.K = np.array(K_list, dtype=np.float64).reshape(3, 3)
+        # Ganho K (metros por pixel)
+        self.declare_parameter("k_gain", 0.01)
 
-        D_list = list(self.get_parameter('camera.D').get_parameter_value().double_array_value)
-        self.D = np.array(D_list, dtype=np.float64).reshape(-1, 1) if len(D_list) > 0 else None
+        # Visualização (Marker)
+        self.declare_parameter("marker_topic", "/base_localization/line")
+        self.declare_parameter("marker_ns", "base_link_lines")
+        self.declare_parameter("marker_line_width", 0.03)
+        self.declare_parameter("marker_color_r", 0.1)
+        self.declare_parameter("marker_color_g", 0.9)
+        self.declare_parameter("marker_color_b", 0.1)
+        self.declare_parameter("marker_color_a", 1.0)
+        self.declare_parameter("marker_lifetime_sec", 0.0)  # 0.0 = infinito
 
-        # ---------- QoS ----------
-        qos_default = QoSProfile(
-            reliability=ReliabilityPolicy.RELIABLE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=10,
+        # Publicações auxiliares
+        self.declare_parameter("publish_pose_array", True)  # pode desligar se quiser só PointStamped
+        self.declare_parameter("points_topic", "/base_localization/points")
+        self.declare_parameter("poses_topic", "/base_localization/poses")
+
+        # ---------------- Lê parâmetros ----------------
+        gp = lambda n: self.get_parameter(n).get_parameter_value()
+
+        self.detection_topic: str = gp("detection_topic").string_value
+        self.num_bases_topic: str = gp("num_bases_topic").string_value
+
+        self.reference_frame: str = gp("reference_frame").string_value
+        self.target_frame: str = gp("target_frame").string_value
+        self.tf_timeout_sec: float = gp("tf_timeout_sec").double_value
+
+        self.det_qos_reliable: bool = gp("detection_qos_reliable").bool_value
+
+        self.k_gain: float = float(gp("k_gain").double_value)
+
+        self.marker_topic: str = gp("marker_topic").string_value
+        self.marker_ns: str = gp("marker_ns").string_value
+        self.marker_line_width: float = float(gp("marker_line_width").double_value)
+        self.marker_color = (
+            float(gp("marker_color_r").double_value),
+            float(gp("marker_color_g").double_value),
+            float(gp("marker_color_b").double_value),
+            float(gp("marker_color_a").double_value),
         )
+        self.marker_lifetime_sec: float = float(gp("marker_lifetime_sec").double_value)
 
-        # ---------- TF ----------
-        self.tf_buffer = tf2_ros.Buffer(cache_time=rclpy.duration.Duration(seconds=10.0))
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.publish_pose_array: bool = gp("publish_pose_array").bool_value
+        self.points_topic: str = gp("points_topic").string_value
+        self.poses_topic: str = gp("poses_topic").string_value
 
-        # ---------- Subs ----------
-        self.create_subscription(Float32MultiArray, self.detected_coords_topic, self.on_detected_coords, qos_default)
+        # ---------------- Convenção da imagem ----------------
+        self.cx_ref = 960.0/2.0
+        self.cy_ref = 720.0/2.0
 
-        # ---------- Estado: poses atuais das bases no frame do drone ----------
-        # key: child_name (str) -> PoseStamped no frame do drone
-        self._targets: Dict[str, PoseStamped] = {}
+        # ---------------- TF ----------------
+        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self, spin_thread=True)
 
-        # ---------- Timer para publicar TF continuamente ----------
-        period = 1.0 / max(1.0, self.tf_publish_rate_hz)
-        self._tf_timer = self.create_timer(period, self._publish_current_tfs)
+        # ---------------- Sub/Pub ----------------
+        self.create_subscription(
+            Float32MultiArray,
+            self.detection_topic,
+            self._detections_cb,
+            make_qos_sensor(self.det_qos_reliable),
+        )
+        self.marker_pub = self.create_publisher(Marker, self.marker_topic, make_qos_marker())
+        self.num_bases_pub = self.create_publisher(Int32, self.num_bases_topic, make_qos_status())
+
+        self.points_pub = self.create_publisher(PointStamped, self.points_topic, make_qos_status())
+        self.poses_pub = self.create_publisher(PoseArray, self.poses_topic, make_qos_status())
+
+        # Serviços
+        self.srv_update = self.create_service(Trigger, "/base_localization/update_markers", self._srv_update_markers)
+        self.srv_clear  = self.create_service(Trigger, "/base_localization/clear_markers", self._srv_clear_markers)
+
+        # Últimas detecções: (x1, y1, x2, y2, score, cx, cy, w, h, dx, dy)
+        self.last_bboxes: List[Tuple[float, float, float, float, float, float, float, float, float, float, float]] = []
+
+        # Controle de IDs de markers
+        self._last_marker_count = 0
 
         self.get_logger().info(
-            f"[base_localization] frames: camera={self.camera_frame} -> drone={self.drone_frame} | "
-            f"K=\n{self.K}\nD={D_list} | topic={self.detected_coords_topic} | tf_rate={self.tf_publish_rate_hz} Hz"
+            "base_localization (modo serviço) iniciado\n"
+            f"  reference_frame : {self.reference_frame}\n"
+            f"  target_frame    : {self.target_frame}\n"
+            f"  detection_topic : {self.detection_topic} (QoS {'RELIABLE' if self.det_qos_reliable else 'BEST_EFFORT'})\n"
+            f"  num_bases_topic : {self.num_bases_topic}\n"
+            f"  k_gain          : {self.k_gain:.4f} (m/pixel)\n"
+            f"  marker_topic    : {self.marker_topic}\n"
+            f"  marker_lifetime : {self.marker_lifetime_sec:.2f} s (0.0 = infinito)\n"
+            f"  points_topic    : {self.points_topic}\n"
+            f"  poses_topic     : {self.poses_topic} (publish_pose_array={self.publish_pose_array})\n"
+            f"  serviços        : /base_localization/update_markers, /base_localization/clear_markers"
         )
 
-        self._logged_tf_error_once = False
+    # ---------------- Callback de detecções ----------------
+    def _detections_cb(self, msg: Float32MultiArray) -> None:
+        data = list(msg.data) if msg.data is not None else []
+        boxes = []
 
-    # ---------- Callback principal ----------
-    def on_detected_coords(self, msg: Float32MultiArray):
-        data = list(msg.data)
-        if len(data) % 5 != 0:
-            self.get_logger().warn("Formato inválido em detected_coords (len % 5 != 0).")
-            return
+        if len(data) >= 5:
+            n = len(data) // 5
+            for i in range(n):
+                x1, y1, x2, y2, score = map(float, data[i * 5 : (i + 1) * 5])
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                w = abs(x2 - x1)
+                h = abs(y2 - y1)
+                dx = cx - self.cx_ref
+                dy = cy - self.cy_ref
+                boxes.append((x1, y1, x2, y2, score, cx, cy, w, h, dx, dy))
 
-        # Verifica TF disponível
-        if not self.tf_buffer.can_transform(self.drone_frame, self.camera_frame, rclpy.time.Time(), timeout=rclpy.duration.Duration(seconds=0.2)):
-            if not self._logged_tf_error_once:
-                self.get_logger().error(
-                    f'TF {self.camera_frame}->{self.drone_frame} indisponível. '
-                    f'Confira os frames no YAML e o /tf_static.'
-                )
-                self._logged_tf_error_once = True
-            return
+        self.last_bboxes = boxes
+        self.num_bases_pub.publish(Int32(data=len(self.last_bboxes)))
 
-        # 3D do quadrado (1x1m) no frame do alvo
-        s = float(self.square_size)
-        obj_pts = np.array([
-            [-s/2.0, -s/2.0, 0.0],  # TL
-            [ s/2.0, -s/2.0, 0.0],  # TR
-            [ s/2.0,  s/2.0, 0.0],  # BR
-            [-s/2.0,  s/2.0, 0.0],  # BL
-        ], dtype=np.float64)
-
-        # vamos preencher um novo conjunto de keys válidas neste frame
-        new_keys: List[str] = []
-        stamp_now = self.get_clock().now().to_msg()
-        idx = 0
-
-        for i in range(0, len(data), 5):
-            x1, y1, x2, y2, score = data[i:i+5]
-            if float(score) < self.min_score:
-                continue
-
-            img_pts = np.array([
-                [x1, y1],  # TL
-                [x2, y1],  # TR
-                [x2, y2],  # BR
-                [x1, y2],  # BL
-            ], dtype=np.float64)
-
-            ok, rvec, tvec = self.solve_pnp(obj_pts, img_pts, self.K, self.D)
-            if not ok or tvec[2] <= 0:
-                continue
-
-            # Pose no frame da CÂMERA
-            pose_cam = rvec_tvec_to_pose(rvec, tvec)
-
-            # Transforma para DRONE via Buffer.transform
-            ps_cam = PoseStamped()
-            ps_cam.header.frame_id = self.camera_frame
-            ps_cam.header.stamp = stamp_now
-            ps_cam.pose = pose_cam
-
+        # Publica um PointStamped POR BASE, já no reference_frame (se TF disponível)
+        if boxes:
             try:
-                ps_drone: PoseStamped = self.tf_buffer.transform(
-                    ps_cam,
-                    self.drone_frame,
-                    timeout=rclpy.duration.Duration(seconds=0.2)
+                tf = self.tf_buffer.lookup_transform(
+                    self.reference_frame,
+                    self.target_frame,
+                    Time(),
+                    timeout=Duration(seconds=self.tf_timeout_sec),
                 )
-            except Exception as e:
-                if not self._logged_tf_error_once:
-                    self.get_logger().error(f"Transform {self.camera_frame}->{self.drone_frame} falhou: {e}")
-                    self._logged_tf_error_once = True
-                return
+                t = tf.transform.translation
+                now = self.get_clock().now().to_msg()
 
-            # Nome do filho TF
-            child_name = f"{self.tf_child_prefix}{idx}"
-            new_keys.append(child_name)
+                for i, (_x1, _y1, _x2, _y2, _s, _cx, _cy, _w, _h, dx, dy) in enumerate(boxes):
+                    vx = self.k_gain * dx
+                    vy = self.k_gain * dy
 
-            # Guarda/atualiza pose deste alvo
-            self._targets[child_name] = ps_drone
+                    p1 = Point(x=float(t.x + vx), y=float(t.y + vy), z=0.0)
 
-            idx += 1
+                    ps = PointStamped()
+                    ps.header.frame_id = self.reference_frame
+                    ps.header.stamp = now
+                    ps.point = p1
+                    self.points_pub.publish(ps)
 
-        # remove alvos antigos que não apareceram neste frame
-        for k in list(self._targets.keys()):
-            if k not in new_keys:
-                del self._targets[k]
+                # Log resumido
+                self.get_logger().info(f"PointStamped publicados: {len(boxes)} base(s).")
 
-    # ---------- Timer: publica TFs correntes continuamente ----------
-    def _publish_current_tfs(self):
-        if not self._targets:
+            except TransformException as ex:
+                self.get_logger().warn(f"TF indisponível {self.reference_frame} <- {self.target_frame}: {ex}")
+            except Exception as ex:
+                self.get_logger().warn(f"Erro ao publicar PointStamped: {ex}")
+        else:
+            self.get_logger().info("Detecções: 0")
+
+    # ---------------- Serviços ----------------
+    def _srv_update_markers(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        # 1) TF do target_frame no reference_frame
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.reference_frame,
+                self.target_frame,
+                Time(),
+                timeout=Duration(seconds=self.tf_timeout_sec),
+            )
+        except TransformException as ex:
+            self._clear_all_markers()
+            response.success = False
+            response.message = f"TF indisponível {self.reference_frame} <- {self.target_frame}: {ex}"
+            return response
+        except Exception as ex:
+            self._clear_all_markers()
+            response.success = False
+            response.message = f"Erro TF: {ex}"
+            return response
+
+        t = tf.transform.translation
+
+        # 2) Se não houver bboxes, limpe markers e retorne
+        if not self.last_bboxes:
+            self._clear_all_markers()
+            response.success = True
+            response.message = "Sem detecções; markers limpos."
+            return response
+
+        # 3) Para cada bbox: calcula P1, publica Marker e (opcional) PoseArray
+        poses = PoseArray()
+        poses.header.frame_id = self.reference_frame
+        poses.header.stamp = self.get_clock().now().to_msg()
+
+        for i, (_x1, _y1, _x2, _y2, _s, _cx, _cy, _w, _h, dx, dy) in enumerate(self.last_bboxes):
+            vx = self.k_gain * dx
+            vy = self.k_gain * dy
+
+            p0 = Point(x=float(t.x), y=float(t.y), z=float(t.z))
+            p1 = Point(x=float(t.x + vx), y=float(t.y + vy), z=0.0)
+
+            # Marker (linha P0->P1)
+            self._publish_line(points=[p0, p1], marker_id=i)
+
+            # (Opcional) PoseArray
+            if self.publish_pose_array:
+                poses.poses.append(Pose(position=p1, orientation=Quaternion(w=1.0)))
+
+            # Log por bbox
+            self.get_logger().info(
+                f"[{i}] Δ(px)=({dx:.1f},{dy:.1f}) => P1=({p1.x:.3f},{p1.y:.3f},{p1.z:.3f})"
+            )
+
+        # Publica PoseArray (se habilitado)
+        if self.publish_pose_array and len(poses.poses) > 0:
+            self.poses_pub.publish(poses)
+
+        # Apaga markers sobrando (se antes havia mais que agora)
+        if self._last_marker_count > len(self.last_bboxes):
+            for marker_id in range(len(self.last_bboxes), self._last_marker_count):
+                self._delete_marker(marker_id)
+        self._last_marker_count = len(self.last_bboxes)
+
+        response.success = True
+        response.message = f"Markers atualizados: {len(self.last_bboxes)} base(s)."
+        return response
+
+    def _srv_clear_markers(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        self._clear_all_markers()
+        response.success = True
+        response.message = "Markers limpos."
+        return response
+
+    # ---------------- Marker helpers ----------------
+    def _new_marker(self, marker_id: int) -> Marker:
+        m = Marker()
+        m.header.frame_id = self.reference_frame
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = self.marker_ns
+        m.id = marker_id
+        m.type = Marker.LINE_STRIP
+        m.scale.x = self.marker_line_width
+        m.color.r, m.color.g, m.color.b, m.color.a = self.marker_color
+        # lifetime: 0.0 => infinito (fica visível após o serviço)
+        if self.marker_lifetime_sec > 0.0:
+            m.lifetime = Duration(seconds=self.marker_lifetime_sec).to_msg()
+        m.pose.orientation.w = 1.0
+        return m
+
+    def _publish_line(self, points: List[Point], marker_id: int) -> None:
+        m = self._new_marker(marker_id)
+        m.action = Marker.ADD
+        m.points = points  # 2 pontos: P0 e P1
+        self.marker_pub.publish(m)
+
+    def _delete_marker(self, marker_id: int) -> None:
+        m = self._new_marker(marker_id)
+        m.action = Marker.DELETE
+        self.marker_pub.publish(m)
+
+    def _clear_all_markers(self) -> None:
+        if self._last_marker_count <= 0:
             return
-        stamp_now = self.get_clock().now().to_msg()
-
-        for child_name, ps_drone in self._targets.items():
-            t = TransformStamped()
-            t.header.stamp = stamp_now
-            t.header.frame_id = self.drone_frame
-            t.child_frame_id = child_name
-            t.transform.translation.x = ps_drone.pose.position.x
-            t.transform.translation.y = ps_drone.pose.position.y
-            t.transform.translation.z = ps_drone.pose.position.z
-            t.transform.rotation = ps_drone.pose.orientation
-            self.tf_broadcaster.sendTransform(t)
-
-    # ---------- Utilidades ----------
-    def solve_pnp(self, obj_pts: np.ndarray, img_pts: np.ndarray,
-                  K: np.ndarray, D: Optional[np.ndarray]) -> Tuple[bool, np.ndarray, np.ndarray]:
-        """Tenta IPPE_SQUARE → SQPNP → ITERATIVE."""
-        for flag in (cv2.SOLVEPNP_IPPE_SQUARE, cv2.SOLVEPNP_SQPNP, cv2.SOLVEPNP_ITERATIVE):
-            try:
-                ok, rvec, tvec = cv2.solvePnP(
-                    objectPoints=obj_pts,
-                    imagePoints=img_pts,
-                    cameraMatrix=K,
-                    distCoeffs=D if (D is not None and D.size > 0) else None,
-                    flags=flag
-                )
-                if ok:
-                    return True, rvec, tvec
-            except Exception:
-                pass
-        return False, None, None
+        for marker_id in range(self._last_marker_count):
+            self._delete_marker(marker_id)
+        self._last_marker_count = 0
 
 
-def main():
-    rclpy.init()
-    node = BaseLocalization()
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = BaseLocalizationNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":

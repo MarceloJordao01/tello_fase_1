@@ -1,0 +1,3 @@
+*.pyc
+tello_main/tello_main/__pycache__/*
+*.pyc

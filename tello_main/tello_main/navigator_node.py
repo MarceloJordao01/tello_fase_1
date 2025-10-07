@@ -16,6 +16,7 @@ from rclpy.parameter import Parameter
 from geometry_msgs.msg import TransformStamped
 from tello_msgs.srv import TelloAction
 from std_srvs.srv import Trigger
+from std_msgs.msg import Bool
 import tf2_ros
 
 
@@ -53,7 +54,8 @@ class TelloNavigator(Node):
     Fluxo:
       - espera URDF/TF do base_link subir;
       - se 'require_start_service': aguarda Trigger '~/start_auto';
-      - realiza takeoff e percorre waypoints (cada um com delay próprio).
+      - realiza takeoff e percorre waypoints.
+      - publica continuamente '~/reach_waypoint' e lê '~/move_next_waypoint'.
     """
 
     def __init__(self):
@@ -76,7 +78,6 @@ class TelloNavigator(Node):
         self.declare_parameter('hold_after_takeoff_s', 0.0)
         self.declare_parameter('hold_between_waypoints_s', 0.0)
 
-        # ⚠️ NÃO usar [] aqui (vira BYTE_ARRAY). Declare sem default e deixe o YAML definir o tipo.
         self.declare_parameter('waypoints_list')
 
         self.ns_abs: str = self.get_parameter('ns_abs').get_parameter_value().string_value
@@ -99,14 +100,11 @@ class TelloNavigator(Node):
         if wp_param.type_ == Parameter.Type.STRING_ARRAY:
             wp_items = list(wp_param.value)
         elif wp_param.type_ == Parameter.Type.STRING:
-            # Caso alguém envie um único item como string
             wp_items = [str(wp_param.value)]
         else:
-            # NOT_SET ou outro tipo => mantém vazio
             wp_items = []
 
         parsed = parse_waypoints_list(wp_items)
-        # (dx,dy,dz,speed,delay_s)
         self.waypoints: List[Tuple[int, int, int, int, float]] = parsed
 
         # ---------------- Estado ----------------
@@ -116,21 +114,28 @@ class TelloNavigator(Node):
         self._started = False
         self._start_evt = threading.Event()
 
+        # Estados dos novos tópicos
+        self._reach_waypoint_state = False       # True quando parado num waypoint, False quando deslocando
+        self._move_next_request = False          # Sinal recebido para ir ao próximo waypoint
+
         # ---------------- TF ----------------
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self._tf_timer = self.create_timer(1.0 / 30.0, self._publish_tf, callback_group=self.cb_group)
 
-        # ---------------- Serviço para iniciar missão ----------------
-        # Usa '~/start_auto' => caminho final '/tello_navigator/start_auto'
+        # ---------------- Serviços e tópicos ----------------
         self._start_srv = self.create_service(Trigger, '~/start_auto', self._on_start_auto, callback_group=self.cb_group)
-
-        # ---------------- Cliente TelloAction ----------------
         self._tello_cli = self.create_client(TelloAction, f'{self.ns_abs}/tello_action')
         self._wait_for_service(self._tello_cli, 'tello_action')
 
-        # Fluxo inicial
+        self._reach_wp_pub = self.create_publisher(Bool, '~/reach_waypoint', 10)
+        self._move_next_sub = self.create_subscription(Bool, '~/move_next_waypoint', self._on_move_next_msg, 10)
+
+        # Timer para publicar continuamente o estado do reach_waypoint
+        self._reach_wp_timer = self.create_timer(0.1, self._reach_wp_publish_timer_cb)
+
+        # Thread principal de missão
         threading.Thread(target=self._startup_sequence, daemon=True).start()
 
     # ---------------- Utils ----------------
@@ -142,8 +147,27 @@ class TelloNavigator(Node):
         if self.debug:
             self.get_logger().info(f'[DEBUG] {msg}')
 
+    def _reach_wp_publish_timer_cb(self):
+        """Publica continuamente o estado atual do reach_waypoint."""
+        msg = Bool()
+        with self._lock:
+            msg.data = self._reach_waypoint_state
+        self._reach_wp_pub.publish(msg)
+
+    def _set_reach_state(self, state: bool):
+        """Apenas altera o estado interno (publicação é contínua)."""
+        with self._lock:
+            if self._reach_waypoint_state != state:
+                self._reach_waypoint_state = state
+                self._logd(f'Alterando reach_waypoint para {state}')
+
+    def _on_move_next_msg(self, msg: Bool):
+        with self._lock:
+            self._move_next_request = bool(msg.data)
+        self._logd(f'Recebido ~/move_next_waypoint = {msg.data}')
+
     # ---------------- Callback do serviço ----------------
-    def _on_start_auto(self, request: Trigger.Request, response: Trigger.Response):
+    def _on_start_auto(self, request, response):
         with self._lock:
             if self._started:
                 response.success = True
@@ -227,6 +251,9 @@ class TelloNavigator(Node):
             self._logd(f'Takeoff: z={self.takeoff_height_m:.2f} m')
 
     def _go_relative_cm(self, dx_cm: int, dy_cm: int, dz_cm: int, speed_cmps: int):
+        # Ao começar a mover: reach_waypoint = False
+        self._set_reach_state(False)
+
         cmd = f'go {dx_cm} {dy_cm} {dz_cm} {speed_cmps}'
         ok = self._send_tello_cmd(cmd)
         if not ok:
@@ -239,11 +266,14 @@ class TelloNavigator(Node):
             start[1] + cm_to_m(dy_cm),
             start[2] + cm_to_m(dz_cm),
         )
-        dist_cm = math.sqrt(dx_cm * dx_cm + dy_cm * dy_cm + dz_cm * dz_cm)
+        dist_cm = math.sqrt(dx_cm**2 + dy_cm**2 + dz_cm**2)
         travel_time_s = dist_cm / float(max(1, speed_cmps))
         self._logd(f'GO: d=({dx_cm},{dy_cm},{dz_cm}) cm, v={speed_cmps} cm/s, t≈{travel_time_s:.2f} s')
 
         self._set_position_incremental(target, travel_time_s)
+
+        # Ao terminar o movimento: chegou ao waypoint
+        self._set_reach_state(True)
 
     # ---------------- Fluxos ----------------
     def _wait_for_base_link(self) -> bool:
@@ -261,15 +291,12 @@ class TelloNavigator(Node):
         return False
 
     def _startup_sequence(self):
-        # 1) aguarda base_link/URDF
         self._wait_for_base_link()
 
-        # 2) aguarda serviço start_auto, se requerido
         if self.require_start_service:
             self._logd('Aguardando serviço ~/start_auto para iniciar missão...')
             self._start_evt.wait()
 
-        # 3) executa missão auto
         try:
             if self.auto_takeoff:
                 self._takeoff()
@@ -278,18 +305,27 @@ class TelloNavigator(Node):
                     time.sleep(self.hold_after_takeoff_s)
 
             if self.auto_start and self.waypoints:
-                for (dx, dy, dz, spd, delay_s) in self.waypoints:
+                for idx, (dx, dy, dz, spd, delay_s) in enumerate(self.waypoints):
+                    with self._lock:
+                        self._move_next_request = False
+
                     self._go_relative_cm(dx, dy, dz, spd)
+
                     wait_s = delay_s if delay_s is not None else self.hold_between_waypoints_s
                     if wait_s > 0.0:
-                        self._logd(f'Aguardando {wait_s:.2f}s antes do próximo waypoint...')
-                        time.sleep(wait_s)
+                        deadline = time.time() + wait_s
+                        self._logd(f'Waypoint {idx}: aguardando {wait_s:.2f}s + sinal ~/move_next_waypoint=True...')
+                        while rclpy.ok():
+                            with self._lock:
+                                allow = self._move_next_request
+                            if time.time() >= deadline and allow:
+                                break
+                            time.sleep(0.05)
         except Exception as e:
             self.get_logger().error(f'Erro no fluxo automático: {e}')
 
 
 def main():
-    # Parâmetros vêm do params.yaml via launch
     rclpy.init(args=None)
     node = TelloNavigator()
     try:

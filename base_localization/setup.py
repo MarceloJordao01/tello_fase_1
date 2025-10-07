@@ -23,7 +23,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'base_localization = base_localization.base_localization:main'
+            'base_localization = base_localization.base_localization:main',
+            'test_marker_pub = base_localization.test_marker_pub:main',
         ],
     },
 )
