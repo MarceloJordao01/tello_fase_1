@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 from typing import List, Tuple
+from dataclasses import dataclass
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -10,7 +12,7 @@ from rclpy.time import Time
 from rclpy.duration import Duration
 
 from std_msgs.msg import Float32MultiArray, Int32
-from geometry_msgs.msg import Point, Pose, PoseArray, Quaternion, PointStamped
+from geometry_msgs.msg import Point, Pose, PoseArray, Quaternion
 from visualization_msgs.msg import Marker
 from std_srvs.srv import Trigger
 
@@ -46,25 +48,95 @@ def make_qos_status() -> QoSProfile:
     )
 
 
+# ---------------- Modelo: Polinômio por eixo com coeficientes dependentes do tamanho ----------------
+@dataclass
+class PolyBySize:
+    """
+    dx' = sum_k ( a_k0 + a_k1*D̃ + a_k2*D̃^2 ) * (dx_raw)^k
+    dy' = sum_k ( c_k0 + c_k1*D̃ + c_k2*D̃^2 ) * (dy_raw)^k
+    onde D̃ = (D - D0)/D0 e D = hypot(w, h) é a diagonal do bbox em px.
+    """
+    D0: float = 300.0  # escala ref da diagonal (px)
+    ax: List[Tuple[float, float, float]] = ((0.0, 0.0, 0.0),  # k=0 (bias)
+                                            (1.0, 0.0, 0.0),  # k=1 (ganho)
+                                            (0.0, 0.0, 0.0))  # k=2
+    ay: List[Tuple[float, float, float]] = ((0.0, 0.0, 0.0),
+                                            (1.0, 0.0, 0.0),
+                                            (0.0, 0.0, 0.0))
+
+    @staticmethod
+    def _polyD(triplet: Tuple[float, float, float], Dt: float) -> float:
+        a0, a1, a2 = triplet
+        return a0 + a1 * Dt + a2 * (Dt ** 2)
+
+    def _apply_axis(self, u: float, coeffs: List[Tuple[float, float, float]], Dt: float) -> float:
+        out = 0.0
+        p = 1.0  # u^k
+        for triplet in coeffs:  # k = 0..K
+            ck = self._polyD(triplet, Dt)
+            out += ck * p
+            p *= u
+        return out
+
+    def apply(self, dx_raw: float, dy_raw: float, w: float, h: float) -> Tuple[float, float]:
+        D = math.hypot(w, h)
+        Dt = 0.0 if self.D0 <= 0.0 else (D - self.D0) / self.D0
+        dx_corr = self._apply_axis(dx_raw, self.ax, Dt)
+        dy_corr = self._apply_axis(dy_raw, self.ay, Dt)
+        return dx_corr, dy_corr
+
+
+# ---------------- Modelo de Z: somente função da diagonal ----------------
+@dataclass
+class ZFromSize:
+    """
+    z' = sum_j ( z_j0 + z_j1*D̃ + z_j2*D̃^2 ) * (D̃)^j
+    - Apenas da diagonal (D) -> não depende de dx_raw/dy_raw.
+    """
+    D0: float = 300.0
+    zc: List[Tuple[float, float, float]] = ((0.0, 0.0, 0.0),  # j=0
+                                            (0.0, 0.0, 0.0),  # j=1
+                                            (0.0, 0.0, 0.0))  # j=2
+    z_default: float = 0.0
+    z_min: float = -10.0
+    z_max: float = 10.0
+
+    @staticmethod
+    def _polyD(c: Tuple[float, float, float], Dt: float) -> float:
+        c0, c1, c2 = c
+        return c0 + c1 * Dt + c2 * (Dt ** 2)
+
+    def apply(self, w: float, h: float) -> float:
+        try:
+            D = math.hypot(w, h)
+            if not math.isfinite(D) or D <= 0.0:
+                return self.z_default
+            Dt = 0.0 if self.D0 <= 0.0 else (D - self.D0) / self.D0
+            z = 0.0
+            p = 1.0  # (D̃)^j
+            for triplet in self.zc:  # j = 0..J
+                cj = self._polyD(triplet, Dt)
+                z += cj * p
+                p *= Dt
+            if not math.isfinite(z):
+                return self.z_default
+            return min(max(z, self.z_min), self.z_max)
+        except Exception:
+            return self.z_default
+
+
 class BaseLocalizationNode(Node):
     """
-    Fluxo:
-      - Assina /base_detection/detected_coords (Float32MultiArray) e guarda o último lote.
-      - No callback de detecção:
-          * Lê TF (reference_frame <- target_frame). Se disponível, para cada bbox:
-              cx=(x1+x2)/2, cy=(y1+y2)/2
-              dx = -cx + 48
-              dy = -cy + 480
-              P0 = TF(target_frame) em reference_frame
-              P1 = P0 + K*(dx,dy,0)   (z de P1 = 0)
-          * Publica um PointStamped (frame = reference_frame) por bbox em /base_localization/points.
-          * Publica /base_detection/num_bases (Int32).
-      - Serviço /base_localization/update_markers (Trigger):
-          * Apenas desenha/atualiza os Markers LINE_STRIP [P0,P1] por bbox (id = índice),
-            e (opcional) publica PoseArray com todos P1.
-      - Serviço /base_localization/clear_markers (Trigger) para remover markers.
-
-    Importante: lifetime padrão do Marker é 0.0 (infinito) para manter visível no RViz após o serviço.
+    - Assina /base_detection/detected_coords e guarda o último lote (self.last_bboxes).
+    - Assina /base_detection/num_bases e guarda o último valor (self.last_num_bases).
+    - Serviço /base_localization/update_markers:
+        * Se last_num_bases == 0 => não adiciona poses novas (limpa markers).
+        * Se > 0 => faz TF (map <- target), computa P1 por bbox:
+            - inversão CRUZADA: dx_raw=-cy+cy_ref, dy_raw=-cx+cx_ref
+            - correção polinomial dependente de D (dx',dy')
+            - z' apenas de D
+            - P1 = origin_map + [K*dx', K*dy', z']
+          Desenha markers P0->P1 e APPEND em PoseArray acumulado.
     """
 
     def __init__(self) -> None:
@@ -78,11 +150,14 @@ class BaseLocalizationNode(Node):
         self.declare_parameter("target_frame", "base_link_1")
         self.declare_parameter("tf_timeout_sec", 0.2)
 
-        # QoS/assinatura das detecções
         self.declare_parameter("detection_qos_reliable", True)
 
-        # Ganho K (metros por pixel)
+        # Ganho K (m/px) para X/Y
         self.declare_parameter("k_gain", 0.01)
+
+        # Centro da imagem (px)
+        self.declare_parameter("cx_ref", 960.0 / 2.0)
+        self.declare_parameter("cy_ref", 720.0 / 2.0)
 
         # Visualização (Marker)
         self.declare_parameter("marker_topic", "/base_localization/line")
@@ -94,10 +169,21 @@ class BaseLocalizationNode(Node):
         self.declare_parameter("marker_color_a", 1.0)
         self.declare_parameter("marker_lifetime_sec", 0.0)  # 0.0 = infinito
 
-        # Publicações auxiliares
-        self.declare_parameter("publish_pose_array", True)  # pode desligar se quiser só PointStamped
-        self.declare_parameter("points_topic", "/base_localization/points")
+        # Publicação do PoseArray acumulado
         self.declare_parameter("poses_topic", "/base_localization/poses")
+
+        # --------------- poly_size (por YAML: D0, ax, ay) ---------------
+        self.declare_parameter("poly_size.D0", 300.0)
+        # ax/ay vêm FLATTENED (lista de floats, múltiplo de 3; triplet por grau)
+        self.declare_parameter("poly_size.ax", [0.0, 0.0, 0.0,   1.0, 0.0, 0.0,   0.0, 0.0, 0.0])
+        self.declare_parameter("poly_size.ay", [0.0, 0.0, 0.0,   1.0, 0.0, 0.0,   0.0, 0.0, 0.0])
+
+        # --------------- z_from_size (por YAML: D0, zc, limites) ---------------
+        self.declare_parameter("z_from_size.D0", 300.0)
+        self.declare_parameter("z_from_size.zc", [0.0, 0.0, 0.0,   0.0, 0.0, 0.0,   0.0, 0.0, 0.0])
+        self.declare_parameter("z_from_size.z_default", 0.0)
+        self.declare_parameter("z_from_size.z_min", -10.0)
+        self.declare_parameter("z_from_size.z_max", 10.0)
 
         # ---------------- Lê parâmetros ----------------
         gp = lambda n: self.get_parameter(n).get_parameter_value()
@@ -113,6 +199,9 @@ class BaseLocalizationNode(Node):
 
         self.k_gain: float = float(gp("k_gain").double_value)
 
+        self.cx_ref: float = float(gp("cx_ref").double_value)
+        self.cy_ref: float = float(gp("cy_ref").double_value)
+
         self.marker_topic: str = gp("marker_topic").string_value
         self.marker_ns: str = gp("marker_ns").string_value
         self.marker_line_width: float = float(gp("marker_line_width").double_value)
@@ -124,13 +213,7 @@ class BaseLocalizationNode(Node):
         )
         self.marker_lifetime_sec: float = float(gp("marker_lifetime_sec").double_value)
 
-        self.publish_pose_array: bool = gp("publish_pose_array").bool_value
-        self.points_topic: str = gp("points_topic").string_value
         self.poses_topic: str = gp("poses_topic").string_value
-
-        # ---------------- Convenção da imagem ----------------
-        self.cx_ref = 960.0/2.0
-        self.cy_ref = 720.0/2.0
 
         # ---------------- TF ----------------
         self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
@@ -143,41 +226,70 @@ class BaseLocalizationNode(Node):
             self._detections_cb,
             make_qos_sensor(self.det_qos_reliable),
         )
+        self.create_subscription(
+            Int32,
+            self.num_bases_topic,
+            self._num_bases_cb,
+            make_qos_status(),
+        )
         self.marker_pub = self.create_publisher(Marker, self.marker_topic, make_qos_marker())
-        self.num_bases_pub = self.create_publisher(Int32, self.num_bases_topic, make_qos_status())
 
-        self.points_pub = self.create_publisher(PointStamped, self.points_topic, make_qos_status())
         self.poses_pub = self.create_publisher(PoseArray, self.poses_topic, make_qos_status())
+        self.poses_accum = PoseArray()
+        self.poses_accum.header.frame_id = self.reference_frame  # acumulado em 'map'
 
-        # Serviços
-        self.srv_update = self.create_service(Trigger, "/base_localization/update_markers", self._srv_update_markers)
-        self.srv_clear  = self.create_service(Trigger, "/base_localization/clear_markers", self._srv_clear_markers)
+        # Correção polinomial e Z a partir dos parâmetros (inclui YAML)
+        self.poly_size = PolyBySize(
+            D0=float(gp("poly_size.D0").double_value),
+            ax=self._parse_triplets(gp("poly_size.ax").double_array_value),
+            ay=self._parse_triplets(gp("poly_size.ay").double_array_value),
+        )
+        self.z_from_size = ZFromSize(
+            D0=float(gp("z_from_size.D0").double_value),
+            zc=self._parse_triplets(gp("z_from_size.zc").double_array_value),
+            z_default=float(gp("z_from_size.z_default").double_value),
+            z_min=float(gp("z_from_size.z_min").double_value),
+            z_max=float(gp("z_from_size.z_max").double_value),
+        )
 
-        # Últimas detecções: (x1, y1, x2, y2, score, cx, cy, w, h, dx, dy)
-        self.last_bboxes: List[Tuple[float, float, float, float, float, float, float, float, float, float, float]] = []
-
-        # Controle de IDs de markers
+        # Estado
+        self.last_bboxes: List[Tuple[float, float, float, float, float, float, float, float, float]] = []
+        self.last_num_bases: int = 0
         self._last_marker_count = 0
 
         self.get_logger().info(
-            "base_localization (modo serviço) iniciado\n"
+            "base_localization (YAML + gate num_bases) iniciado\n"
+            f"  detection_topic : {self.detection_topic}\n"
+            f"  num_bases_topic : {self.num_bases_topic}\n"
             f"  reference_frame : {self.reference_frame}\n"
             f"  target_frame    : {self.target_frame}\n"
-            f"  detection_topic : {self.detection_topic} (QoS {'RELIABLE' if self.det_qos_reliable else 'BEST_EFFORT'})\n"
-            f"  num_bases_topic : {self.num_bases_topic}\n"
-            f"  k_gain          : {self.k_gain:.4f} (m/pixel)\n"
-            f"  marker_topic    : {self.marker_topic}\n"
-            f"  marker_lifetime : {self.marker_lifetime_sec:.2f} s (0.0 = infinito)\n"
-            f"  points_topic    : {self.points_topic}\n"
-            f"  poses_topic     : {self.poses_topic} (publish_pose_array={self.publish_pose_array})\n"
-            f"  serviços        : /base_localization/update_markers, /base_localization/clear_markers"
+            f"  k_gain          : {self.k_gain:.4f} (m/px)\n"
+            f"  cx_ref, cy_ref  : {self.cx_ref:.1f}, {self.cy_ref:.1f}\n"
+            f"  poses_topic     : {self.poses_topic}\n"
+            f"  poly_size D0    : {self.poly_size.D0}\n"
+            f"  z_from_size D0  : {self.z_from_size.D0}"
         )
 
-    # ---------------- Callback de detecções ----------------
+    # -------- helpers ----------
+    @staticmethod
+    def _parse_triplets(arr: List[float]) -> List[Tuple[float, float, float]]:
+        """Recebe lista FLAT [a,b,c, a,b,c, ...] e devolve [(a,b,c), ...]."""
+        out: List[Tuple[float, float, float]] = []
+        if arr is None:
+            return out
+        vec = list(arr)
+        if len(vec) % 3 != 0:
+            # tolera e trunca o excedente
+            n = (len(vec) // 3) * 3
+            vec = vec[:n]
+        for i in range(0, len(vec), 3):
+            out.append((float(vec[i]), float(vec[i+1]), float(vec[i+2])))
+        return out
+
+    # ---------------- Callbacks ----------------
     def _detections_cb(self, msg: Float32MultiArray) -> None:
         data = list(msg.data) if msg.data is not None else []
         boxes = []
-
         if len(data) >= 5:
             n = len(data) // 5
             for i in range(n):
@@ -186,15 +298,80 @@ class BaseLocalizationNode(Node):
                 cy = (y1 + y2) / 2.0
                 w = abs(x2 - x1)
                 h = abs(y2 - y1)
-                dx = cx - self.cx_ref
-                dy = cy - self.cy_ref
-                boxes.append((x1, y1, x2, y2, score, cx, cy, w, h, dx, dy))
-
+                boxes.append((x1, y1, x2, y2, score, cx, cy, w, h))
         self.last_bboxes = boxes
-        self.num_bases_pub.publish(Int32(data=len(self.last_bboxes)))
+        self.get_logger().debug(f"Detecções recebidas: {len(boxes)}")
 
-        # Publica um PointStamped POR BASE, já no reference_frame (se TF disponível)
-        if boxes:
+    def _num_bases_cb(self, msg: Int32) -> None:
+        self.last_num_bases = int(msg.data)
+        self.get_logger().debug(f"num_bases atualizado: {self.last_num_bases}")
+
+    # ---------------- Função única: recebe só o bbox e calcula tudo ----------------
+    def compute_p1_from_bbox(self, bbox: Tuple[float, float, float, float, float]) -> Point:
+        """
+        bbox = (x1, y1, x2, y2, score) em px.
+        - TF lookup (map <- target_frame) -> origin_map
+        - (cx,cy,w,h), inversão CRUZADA: dx_raw=-cy+cy_ref, dy_raw=-cx+cx_ref
+        - correção polinomial dependente de D -> (dx',dy')
+        - z' só de D
+        - P1 = origin_map + [K*dx', K*dy', z']
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                self.reference_frame,
+                self.target_frame,
+                Time(),
+                timeout=Duration(seconds=self.tf_timeout_sec),
+            )
+        except Exception as ex:
+            raise RuntimeError(f"TF indisponível {self.reference_frame} <- {self.target_frame}: {ex}")
+
+        t = tf.transform.translation
+        origin_map = Point(x=float(t.x), y=float(t.y), z=float(t.z))
+
+        x1, y1, x2, y2, _score = bbox
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        w = abs(x2 - x1)
+        h = abs(y2 - y1)
+
+        # inversão CRUZADA (como você definiu)
+        dx_raw = -cy + self.cy_ref
+        dy_raw = -cx + self.cx_ref
+
+        dx_corr, dy_corr = self.poly_size.apply(dx_raw, dy_raw, w, h)
+        z_corr = self.z_from_size.apply(w, h)
+
+        vx = self.k_gain * dx_corr
+        vy = self.k_gain * dy_corr
+        return Point(x=float(origin_map.x + vx), y=float(origin_map.y + vy), z=float(z_corr))
+
+    # ---------------- Serviços ----------------
+    def _srv_update_markers(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+        # Gate: só atualiza se houver bases novas
+        if self.last_num_bases <= 0:
+            self._clear_all_markers()
+            response.success = True
+            response.message = "Sem bases novas (num_bases == 0). Markers limpos; PoseArray preservado."
+            return response
+
+        if not self.last_bboxes:
+            self._clear_all_markers()
+            response.success = True
+            response.message = "Sem detecções no último lote. Markers limpos; PoseArray preservado."
+            return response
+
+        now = self.get_clock().now().to_msg()
+
+        appended = 0
+        for i, (x1, y1, x2, y2, s, _cx, _cy, _w, _h) in enumerate(self.last_bboxes):
+            try:
+                p1 = self.compute_p1_from_bbox((x1, y1, x2, y2, s))
+            except RuntimeError as ex:
+                self.get_logger().warn(str(ex))
+                continue
+
+            # P0 para desenhar a linha (se TF falhar aqui, ainda preservamos o Pose)
             try:
                 tf = self.tf_buffer.lookup_transform(
                     self.reference_frame,
@@ -203,102 +380,35 @@ class BaseLocalizationNode(Node):
                     timeout=Duration(seconds=self.tf_timeout_sec),
                 )
                 t = tf.transform.translation
-                now = self.get_clock().now().to_msg()
-
-                for i, (_x1, _y1, _x2, _y2, _s, _cx, _cy, _w, _h, dx, dy) in enumerate(boxes):
-                    vx = self.k_gain * dx
-                    vy = self.k_gain * dy
-
-                    p1 = Point(x=float(t.x + vx), y=float(t.y + vy), z=0.0)
-
-                    ps = PointStamped()
-                    ps.header.frame_id = self.reference_frame
-                    ps.header.stamp = now
-                    ps.point = p1
-                    self.points_pub.publish(ps)
-
-                # Log resumido
-                self.get_logger().info(f"PointStamped publicados: {len(boxes)} base(s).")
-
-            except TransformException as ex:
-                self.get_logger().warn(f"TF indisponível {self.reference_frame} <- {self.target_frame}: {ex}")
+                p0 = Point(x=float(t.x), y=float(t.y), z=float(t.z))
             except Exception as ex:
-                self.get_logger().warn(f"Erro ao publicar PointStamped: {ex}")
-        else:
-            self.get_logger().info("Detecções: 0")
+                self.get_logger().warn(f"TF para marker: {ex}")
+                p0 = Point(x=0.0, y=0.0, z=0.0)
 
-    # ---------------- Serviços ----------------
-    def _srv_update_markers(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        # 1) TF do target_frame no reference_frame
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.reference_frame,
-                self.target_frame,
-                Time(),
-                timeout=Duration(seconds=self.tf_timeout_sec),
-            )
-        except TransformException as ex:
-            self._clear_all_markers()
-            response.success = False
-            response.message = f"TF indisponível {self.reference_frame} <- {self.target_frame}: {ex}"
-            return response
-        except Exception as ex:
-            self._clear_all_markers()
-            response.success = False
-            response.message = f"Erro TF: {ex}"
-            return response
-
-        t = tf.transform.translation
-
-        # 2) Se não houver bboxes, limpe markers e retorne
-        if not self.last_bboxes:
-            self._clear_all_markers()
-            response.success = True
-            response.message = "Sem detecções; markers limpos."
-            return response
-
-        # 3) Para cada bbox: calcula P1, publica Marker e (opcional) PoseArray
-        poses = PoseArray()
-        poses.header.frame_id = self.reference_frame
-        poses.header.stamp = self.get_clock().now().to_msg()
-
-        for i, (_x1, _y1, _x2, _y2, _s, _cx, _cy, _w, _h, dx, dy) in enumerate(self.last_bboxes):
-            vx = self.k_gain * dx
-            vy = self.k_gain * dy
-
-            p0 = Point(x=float(t.x), y=float(t.y), z=float(t.z))
-            p1 = Point(x=float(t.x + vx), y=float(t.y + vy), z=0.0)
-
-            # Marker (linha P0->P1)
             self._publish_line(points=[p0, p1], marker_id=i)
+            self.poses_accum.poses.append(Pose(position=p1, orientation=Quaternion(w=1.0)))
+            appended += 1
 
-            # (Opcional) PoseArray
-            if self.publish_pose_array:
-                poses.poses.append(Pose(position=p1, orientation=Quaternion(w=1.0)))
+        self.poses_accum.header.frame_id = self.reference_frame
+        self.poses_accum.header.stamp = now
+        self.poses_pub.publish(self.poses_accum)
 
-            # Log por bbox
-            self.get_logger().info(
-                f"[{i}] Δ(px)=({dx:.1f},{dy:.1f}) => P1=({p1.x:.3f},{p1.y:.3f},{p1.z:.3f})"
-            )
-
-        # Publica PoseArray (se habilitado)
-        if self.publish_pose_array and len(poses.poses) > 0:
-            self.poses_pub.publish(poses)
-
-        # Apaga markers sobrando (se antes havia mais que agora)
         if self._last_marker_count > len(self.last_bboxes):
             for marker_id in range(len(self.last_bboxes), self._last_marker_count):
                 self._delete_marker(marker_id)
         self._last_marker_count = len(self.last_bboxes)
 
         response.success = True
-        response.message = f"Markers atualizados: {len(self.last_bboxes)} base(s)."
+        response.message = (
+            f"Markers atualizados. {appended} pose(s) novas adicionadas (num_bases={self.last_num_bases}). "
+            f"PoseArray total: {len(self.poses_accum.poses)}"
+        )
         return response
 
     def _srv_clear_markers(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
         self._clear_all_markers()
         response.success = True
-        response.message = "Markers limpos."
+        response.message = "Markers limpos (PoseArray acumulado preservado)."
         return response
 
     # ---------------- Marker helpers ----------------
@@ -311,7 +421,6 @@ class BaseLocalizationNode(Node):
         m.type = Marker.LINE_STRIP
         m.scale.x = self.marker_line_width
         m.color.r, m.color.g, m.color.b, m.color.a = self.marker_color
-        # lifetime: 0.0 => infinito (fica visível após o serviço)
         if self.marker_lifetime_sec > 0.0:
             m.lifetime = Duration(seconds=self.marker_lifetime_sec).to_msg()
         m.pose.orientation.w = 1.0
@@ -320,7 +429,7 @@ class BaseLocalizationNode(Node):
     def _publish_line(self, points: List[Point], marker_id: int) -> None:
         m = self._new_marker(marker_id)
         m.action = Marker.ADD
-        m.points = points  # 2 pontos: P0 e P1
+        m.points = points
         self.marker_pub.publish(m)
 
     def _delete_marker(self, marker_id: int) -> None:

@@ -1,19 +1,56 @@
 base_localization:
   ros__parameters:
-    # Tópico com bboxes [x1,y1,x2,y2,score,...]
-    detected_coords_topic: "/base_detection/detected_coords"
 
-    # Frames (AJUSTADOS)
-    camera_frame: "espcam_link_1"   # << existe no seu /tf_static
-    drone_frame:  "base_link_1"     # << existe no seu /tf
+    # tópicos
+    detection_topic: "/base_detection/detected_coords"
+    num_bases_topic: "/base_detection/num_bases"
 
-    # Alvo
-    square_size_m: 1.0
-    min_score: 0.25
+    # frames e TF
+    reference_frame: "map"
+    target_frame: "base_link_1"
+    tf_timeout_sec: 0.2
 
-    # Câmera (pinhole) — intrínsecos e distorção
-    camera:
-      # K = [fx, 0, cx,  0, fy, cy,  0, 0, 1]  (AJUSTE para sua calibração real)
-      K: [600.0, 0.0, 320.0,  0.0, 600.0, 240.0,  0.0, 0.0, 1.0]
-      # D = [k1, k2, p1, p2, k3] (plumb_bob/OpenCV). Ajuste conforme sua calibração.
-      D: [0.0, 0.0, 0.0, 0.0, 0.0]
+    # QoS das detecções
+    detection_qos_reliable: true
+
+    # ganho XY (m/px)
+    k_gain: 0.01
+
+    # centro da imagem (px)
+    cx_ref: 480.0
+    cy_ref: 360.0
+
+    # markers
+    marker_topic: "/base_localization/line"
+    marker_ns: "base_link_lines"
+    marker_line_width: 0.03
+    marker_color_r: 0.1
+    marker_color_g: 0.9
+    marker_color_b: 0.1
+    marker_color_a: 1.0
+    marker_lifetime_sec: 0.0
+
+    # saída
+    poses_topic: "/base_localization/poses"
+
+    # --- poly_size ---
+    poly_size.D0: 300.0
+
+    # ax (X): [a_00, a_01, a_02,   a_10, a_11, a_12,   a_20, a_21, a_22]
+    #          k=0 (bias)          k=1 (ganho)          k=2 (quadrático)
+    # identidade por padrão:
+    poly_size.ax: [0.0, 0.0, 0.0,   1.0, 0.0, 0.0,      0.0, 0.0, 0.0]
+
+    # ay (Y): mesma estrutura
+    poly_size.ay: [0.0, 0.0, 0.0,   1.0, 0.0, 0.0,      0.0, 0.0, 0.0]
+
+    # --- z_from_size ---
+    z_from_size.D0: 300.0
+
+    # zc (j = 0,1,2): [(z_00, z_01, z_02), (z_10, z_11, z_12), (z_20, z_21, z_22)]
+    # FLAT: [z_00,z_01,z_02,  z_10,z_11,z_12,  z_20,z_21,z_22]
+    z_from_size.zc: [0.0, 0.0, 0.0,   0.0, 0.0, 0.0,   0.0, 0.0, 0.0]
+
+    z_from_size.z_default: 0.0
+    z_from_size.z_min: -10.0
+    z_from_size.z_max: 10.0
