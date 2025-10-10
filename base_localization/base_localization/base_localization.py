@@ -129,7 +129,7 @@ class BaseLocalizationNode(Node):
     """
     - Assina /base_detection/detected_coords e guarda o último lote (self.last_bboxes).
     - Assina /base_detection/num_bases e guarda o último valor (self.last_num_bases).
-    - Serviço /base_localization/update_markers:
+    - Serviço ~/update_markers:
         * Se last_num_bases == 0 => não adiciona poses novas (limpa markers).
         * Se > 0 => faz TF (map <- target), computa P1 por bbox:
             - inversão CRUZADA: dx_raw=-cy+cy_ref, dy_raw=-cx+cx_ref
@@ -137,6 +137,8 @@ class BaseLocalizationNode(Node):
             - z' apenas de D
             - P1 = origin_map + [K*dx', K*dy', z']
           Desenha markers P0->P1 e APPEND em PoseArray acumulado.
+    - Serviço ~/clear_markers:
+        * Limpa apenas os markers (preserva PoseArray acumulado).
     """
 
     def __init__(self) -> None:
@@ -257,6 +259,16 @@ class BaseLocalizationNode(Node):
         self.last_num_bases: int = 0
         self._last_marker_count = 0
 
+        # ---------------- Serviços ----------------
+        # Use nomes privados do nó (~) para aparecerem como /base_localization/<nome>
+        self.update_markers_srv = self.create_service(
+            Trigger, '~/update_markers', self._srv_update_markers
+        )
+        self.clear_markers_srv = self.create_service(
+            Trigger, '~/clear_markers', self._srv_clear_markers
+        )
+
+        # Logs iniciais
         self.get_logger().info(
             "base_localization (YAML + gate num_bases) iniciado\n"
             f"  detection_topic : {self.detection_topic}\n"
@@ -269,6 +281,15 @@ class BaseLocalizationNode(Node):
             f"  poly_size D0    : {self.poly_size.D0}\n"
             f"  z_from_size D0  : {self.z_from_size.D0}"
         )
+        try:
+            # Mostra nomes resolvidos dos serviços para facilitar debug
+            resolved_update = self.update_markers_srv.srv_name  # type: ignore[attr-defined]
+            resolved_clear = self.clear_markers_srv.srv_name    # type: ignore[attr-defined]
+            self.get_logger().info(f"Serviço disponível: {resolved_update}")
+            self.get_logger().info(f"Serviço disponível: {resolved_clear}")
+        except Exception:
+            # Fallback (nem toda versão expõe srv_name)
+            self.get_logger().info("Serviços disponíveis: ~/update_markers e ~/clear_markers")
 
     # -------- helpers ----------
     @staticmethod
