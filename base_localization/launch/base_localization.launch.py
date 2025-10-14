@@ -25,7 +25,7 @@ def generate_launch_description():
     node = Node(
         package='base_localization',
         executable='base_localization',
-        name='base_localization',           # deve bater com a chave do YAML
+        name='base_localization',
         output='screen',
         emulate_tty=True,
         parameters=[LaunchConfiguration('params_file')],

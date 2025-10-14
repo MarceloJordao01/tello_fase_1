@@ -13,6 +13,7 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/sim.launch.py',
             'launch/real.launch.py',
+            'launch/calib.launch.py',
         ]),
         ('share/' + package_name + '/config', [
             'config/params.yaml',

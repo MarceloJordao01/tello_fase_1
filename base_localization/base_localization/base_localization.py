@@ -17,7 +17,6 @@ from visualization_msgs.msg import Marker
 from std_srvs.srv import Trigger
 
 import tf2_ros
-from tf2_ros import TransformException
 
 
 # ---------------- QoS helpers ----------------
@@ -52,17 +51,25 @@ def make_qos_status() -> QoSProfile:
 @dataclass
 class PolyBySize:
     """
-    dx' = sum_k ( a_k0 + a_k1*D̃ + a_k2*D̃^2 ) * (dx_raw)^k
-    dy' = sum_k ( c_k0 + c_k1*D̃ + c_k2*D̃^2 ) * (dy_raw)^k
-    onde D̃ = (D - D0)/D0 e D = hypot(w, h) é a diagonal do bbox em px.
+    Δx' = Σ_k A_k(ṼD)·(ΔX_raw)^k
+    Δy' = Σ_k C_k(ṼD)·(ΔY_raw)^k
+
+    onde:
+      - A_k(ṼD) = a_{k0} + a_{k1}·ṼD + a_{k2}·ṼD^2
+      - C_k(ṼD) = c_{k0} + c_{k1}·ṼD + c_{k2}·ṼD^2
+      - ṼD = (D - D0)/D0 e D = hypot(w, h) (diagonal do bbox em px).
     """
     D0: float = 300.0  # escala ref da diagonal (px)
-    ax: List[Tuple[float, float, float]] = ((0.0, 0.0, 0.0),  # k=0 (bias)
-                                            (1.0, 0.0, 0.0),  # k=1 (ganho)
-                                            (0.0, 0.0, 0.0))  # k=2
-    ay: List[Tuple[float, float, float]] = ((0.0, 0.0, 0.0),
-                                            (1.0, 0.0, 0.0),
-                                            (0.0, 0.0, 0.0))
+    ax: List[Tuple[float, float, float]] = (
+        (0.0, 0.0, 0.0),  # k=0 (bias)
+        (1.0, 0.0, 0.0),  # k=1 (ganho)
+        (0.0, 0.0, 0.0),  # k=2
+    )
+    ay: List[Tuple[float, float, float]] = (
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+    )
 
     @staticmethod
     def _polyD(triplet: Tuple[float, float, float], Dt: float) -> float:
@@ -70,6 +77,7 @@ class PolyBySize:
         return a0 + a1 * Dt + a2 * (Dt ** 2)
 
     def _apply_axis(self, u: float, coeffs: List[Tuple[float, float, float]], Dt: float) -> float:
+        # Calcula Σ_k C_k(ṼD)·u^k
         out = 0.0
         p = 1.0  # u^k
         for triplet in coeffs:  # k = 0..K
@@ -81,6 +89,7 @@ class PolyBySize:
     def apply(self, dx_raw: float, dy_raw: float, w: float, h: float) -> Tuple[float, float]:
         D = math.hypot(w, h)
         Dt = 0.0 if self.D0 <= 0.0 else (D - self.D0) / self.D0
+        # Cada eixo usa apenas o seu Δ raw (sem trocas)
         dx_corr = self._apply_axis(dx_raw, self.ax, Dt)
         dy_corr = self._apply_axis(dy_raw, self.ay, Dt)
         return dx_corr, dy_corr
@@ -90,13 +99,15 @@ class PolyBySize:
 @dataclass
 class ZFromSize:
     """
-    z' = sum_j ( z_j0 + z_j1*D̃ + z_j2*D̃^2 ) * (D̃)^j
-    - Apenas da diagonal (D) -> não depende de dx_raw/dy_raw.
+    z' = Σ_j Z_j(ṼD)·(ṼD)^j, com Z_j(ṼD) = z_{j0} + z_{j1}·ṼD + z_{j2}·ṼD^2.
+    - Apenas da diagonal (D) -> não depende de ΔX_raw/ΔY_raw.
     """
     D0: float = 300.0
-    zc: List[Tuple[float, float, float]] = ((0.0, 0.0, 0.0),  # j=0
-                                            (0.0, 0.0, 0.0),  # j=1
-                                            (0.0, 0.0, 0.0))  # j=2
+    zc: List[Tuple[float, float, float]] = (
+        (0.0, 0.0, 0.0),  # j=0
+        (0.0, 0.0, 0.0),  # j=1
+        (0.0, 0.0, 0.0),  # j=2
+    )
     z_default: float = 0.0
     z_min: float = -10.0
     z_max: float = 10.0
@@ -113,7 +124,7 @@ class ZFromSize:
                 return self.z_default
             Dt = 0.0 if self.D0 <= 0.0 else (D - self.D0) / self.D0
             z = 0.0
-            p = 1.0  # (D̃)^j
+            p = 1.0  # (ṼD)^j
             for triplet in self.zc:  # j = 0..J
                 cj = self._polyD(triplet, Dt)
                 z += cj * p
@@ -132,11 +143,12 @@ class BaseLocalizationNode(Node):
     - Serviço ~/update_markers:
         * Se last_num_bases == 0 => não adiciona poses novas (limpa markers).
         * Se > 0 => faz TF (map <- target), computa P1 por bbox:
-            - inversão CRUZADA: dx_raw=-cy+cy_ref, dy_raw=-cx+cx_ref
-            - correção polinomial dependente de D (dx',dy')
+            - ΔX_raw = cx_ref - cx, ΔY_raw = cy_ref - cy   (MESMO padrão do calib)
+            - correção polinomial por eixo (cada eixo usa seu Δ raw)
             - z' apenas de D
-            - P1 = origin_map + [K*dx', K*dy', z']
+            - P1 = origin_map + [Δx', Δy', z']   (sem k_gain)
           Desenha markers P0->P1 e APPEND em PoseArray acumulado.
+      No retorno do serviço, imprime o vetor `base_link -> inferência` para cada bbox.
     - Serviço ~/clear_markers:
         * Limpa apenas os markers (preserva PoseArray acumulado).
     """
@@ -154,10 +166,7 @@ class BaseLocalizationNode(Node):
 
         self.declare_parameter("detection_qos_reliable", True)
 
-        # Ganho K (m/px) para X/Y
-        self.declare_parameter("k_gain", 0.01)
-
-        # Centro da imagem (px)
+        # Centro da imagem (px) — agora interpretado DIRETAMENTE (sem swap)
         self.declare_parameter("cx_ref", 960.0 / 2.0)
         self.declare_parameter("cy_ref", 720.0 / 2.0)
 
@@ -199,8 +208,7 @@ class BaseLocalizationNode(Node):
 
         self.det_qos_reliable: bool = gp("detection_qos_reliable").bool_value
 
-        self.k_gain: float = float(gp("k_gain").double_value)
-
+        # Lidos do YAML…
         self.cx_ref: float = float(gp("cx_ref").double_value)
         self.cy_ref: float = float(gp("cy_ref").double_value)
 
@@ -260,7 +268,6 @@ class BaseLocalizationNode(Node):
         self._last_marker_count = 0
 
         # ---------------- Serviços ----------------
-        # Use nomes privados do nó (~) para aparecerem como /base_localization/<nome>
         self.update_markers_srv = self.create_service(
             Trigger, '~/update_markers', self._srv_update_markers
         )
@@ -270,25 +277,23 @@ class BaseLocalizationNode(Node):
 
         # Logs iniciais
         self.get_logger().info(
-            "base_localization (YAML + gate num_bases) iniciado\n"
+            "base_localization iniciado (sem k_gain)\n"
             f"  detection_topic : {self.detection_topic}\n"
             f"  num_bases_topic : {self.num_bases_topic}\n"
             f"  reference_frame : {self.reference_frame}\n"
             f"  target_frame    : {self.target_frame}\n"
-            f"  k_gain          : {self.k_gain:.4f} (m/px)\n"
-            f"  cx_ref, cy_ref  : {self.cx_ref:.1f}, {self.cy_ref:.1f}\n"
+            f"  cx_ref(read)    : {self.cx_ref:.1f}\n"
+            f"  cy_ref(read)    : {self.cy_ref:.1f}\n"
             f"  poses_topic     : {self.poses_topic}\n"
             f"  poly_size D0    : {self.poly_size.D0}\n"
             f"  z_from_size D0  : {self.z_from_size.D0}"
         )
         try:
-            # Mostra nomes resolvidos dos serviços para facilitar debug
             resolved_update = self.update_markers_srv.srv_name  # type: ignore[attr-defined]
             resolved_clear = self.clear_markers_srv.srv_name    # type: ignore[attr-defined]
             self.get_logger().info(f"Serviço disponível: {resolved_update}")
             self.get_logger().info(f"Serviço disponível: {resolved_clear}")
         except Exception:
-            # Fallback (nem toda versão expõe srv_name)
             self.get_logger().info("Serviços disponíveis: ~/update_markers e ~/clear_markers")
 
     # -------- helpers ----------
@@ -300,7 +305,6 @@ class BaseLocalizationNode(Node):
             return out
         vec = list(arr)
         if len(vec) % 3 != 0:
-            # tolera e trunca o excedente
             n = (len(vec) // 3) * 3
             vec = vec[:n]
         for i in range(0, len(vec), 3):
@@ -327,15 +331,15 @@ class BaseLocalizationNode(Node):
         self.last_num_bases = int(msg.data)
         self.get_logger().debug(f"num_bases atualizado: {self.last_num_bases}")
 
-    # ---------------- Função única: recebe só o bbox e calcula tudo ----------------
+    # ---------------- Cálculo ponto alvo ----------------
     def compute_p1_from_bbox(self, bbox: Tuple[float, float, float, float, float]) -> Point:
         """
         bbox = (x1, y1, x2, y2, score) em px.
         - TF lookup (map <- target_frame) -> origin_map
-        - (cx,cy,w,h), inversão CRUZADA: dx_raw=-cy+cy_ref, dy_raw=-cx+cx_ref
-        - correção polinomial dependente de D -> (dx',dy')
+        - (cx,cy,w,h), deltas DIRETOS: ΔX_raw = cx_ref - cx, ΔY_raw = cy_ref - cy
+        - correção polinomial por eixo -> (Δx',Δy')
         - z' só de D
-        - P1 = origin_map + [K*dx', K*dy', z']
+        - P1 = origin_map + [Δx', Δy', z']   (sem k_gain)
         """
         try:
             tf = self.tf_buffer.lookup_transform(
@@ -356,20 +360,20 @@ class BaseLocalizationNode(Node):
         w = abs(x2 - x1)
         h = abs(y2 - y1)
 
-        # inversão CRUZADA (como você definiu)
-        dx_raw = -cy + self.cy_ref
-        dy_raw = -cx + self.cx_ref
+        # Deltas DIRETOS (MESMO padrão do calib, sem swap)
+        dx_raw = self.cx_ref - cx
+        dy_raw = self.cy_ref - cy
 
         dx_corr, dy_corr = self.poly_size.apply(dx_raw, dy_raw, w, h)
         z_corr = self.z_from_size.apply(w, h)
 
-        vx = self.k_gain * dx_corr
-        vy = self.k_gain * dy_corr
+        # Sem k_gain: usa diretamente os valores corrigidos
+        vx = dx_corr
+        vy = dy_corr
         return Point(x=float(origin_map.x + vx), y=float(origin_map.y + vy), z=float(z_corr))
 
     # ---------------- Serviços ----------------
     def _srv_update_markers(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
-        # Gate: só atualiza se houver bases novas
         if self.last_num_bases <= 0:
             self._clear_all_markers()
             response.success = True
@@ -385,6 +389,8 @@ class BaseLocalizationNode(Node):
         now = self.get_clock().now().to_msg()
 
         appended = 0
+        vectors_info: List[str] = []
+
         for i, (x1, y1, x2, y2, s, _cx, _cy, _w, _h) in enumerate(self.last_bboxes):
             try:
                 p1 = self.compute_p1_from_bbox((x1, y1, x2, y2, s))
@@ -392,7 +398,7 @@ class BaseLocalizationNode(Node):
                 self.get_logger().warn(str(ex))
                 continue
 
-            # P0 para desenhar a linha (se TF falhar aqui, ainda preservamos o Pose)
+            # P0 para desenhar a linha (pose atual do base_link no mapa)
             try:
                 tf = self.tf_buffer.lookup_transform(
                     self.reference_frame,
@@ -406,9 +412,18 @@ class BaseLocalizationNode(Node):
                 self.get_logger().warn(f"TF para marker: {ex}")
                 p0 = Point(x=0.0, y=0.0, z=0.0)
 
+            # Publica linha e atualiza PoseArray
             self._publish_line(points=[p0, p1], marker_id=i)
             self.poses_accum.poses.append(Pose(position=p1, orientation=Quaternion(w=1.0)))
             appended += 1
+
+            # Vetor base_link -> inferência (no frame 'map')
+            vx = float(p1.x - p0.x)
+            vy = float(p1.y - p0.y)
+            vz = float(p1.z - p0.z)
+            vectors_info.append(
+                f"#{i}: v=[{vx:.3f}, {vy:.3f}, {vz:.3f}] p1=[{p1.x:.3f}, {p1.y:.3f}, {p1.z:.3f}]"
+            )
 
         self.poses_accum.header.frame_id = self.reference_frame
         self.poses_accum.header.stamp = now
@@ -419,11 +434,16 @@ class BaseLocalizationNode(Node):
                 self._delete_marker(marker_id)
         self._last_marker_count = len(self.last_bboxes)
 
+        # Monta mensagem do serviço incluindo os vetores de inferência
+        vectors_block = "\n  ".join(vectors_info) if vectors_info else "(nenhum)"
         response.success = True
         response.message = (
             f"Markers atualizados. {appended} pose(s) novas adicionadas (num_bases={self.last_num_bases}). "
-            f"PoseArray total: {len(self.poses_accum.poses)}"
+            f"PoseArray total: {len(self.poses_accum.poses)}\n"
+            f"  vetores base_link->inferencia (no frame '{self.reference_frame}'):\n  {vectors_block}"
         )
+        # Também loga para facilitar depuração
+        self.get_logger().info(response.message)
         return response
 
     def _srv_clear_markers(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:

@@ -13,12 +13,9 @@ base_localization:
     # QoS das detecções
     detection_qos_reliable: true
 
-    # ganho XY (m/px)
-    k_gain: 0.01
-
     # centro da imagem (px)
-    cx_ref: 480.0
-    cy_ref: 360.0
+    cx_ref: 360.0
+    cy_ref: 480.0
 
     # markers
     marker_topic: "/base_localization/line"
@@ -34,23 +31,28 @@ base_localization:
     poses_topic: "/base_localization/poses"
 
     # --- poly_size ---
-    poly_size.D0: 300.0
+    poly_size.D0: 2442.43
 
     # ax (X): [a_00, a_01, a_02,   a_10, a_11, a_12,   a_20, a_21, a_22]
-    #          k=0 (bias)          k=1 (ganho)          k=2 (quadrático)
-    # identidade por padrão:
-    poly_size.ax: [0.0, 0.0, 0.0,   1.0, 0.0, 0.0,      0.0, 0.0, 0.0]
+    poly_size.ax: [218.77, 5923.07, -695.59,
+                   2.55, -181.40, -6303.05,
+                   0.06, 3.84, 56.13]
 
     # ay (Y): mesma estrutura
-    poly_size.ay: [0.0, 0.0, 0.0,   1.0, 0.0, 0.0,      0.0, 0.0, 0.0]
+    poly_size.ay: [-253.77, -7275.43, 1332.30,
+                   -0.78, 68.92, 2688.84,
+                   0.05, 3.79, 63.02]
 
     # --- z_from_size ---
-    z_from_size.D0: 300.0
+    z_from_size.D0: 2442.43
 
-    # zc (j = 0,1,2): [(z_00, z_01, z_02), (z_10, z_11, z_12), (z_20, z_21, z_22)]
+    # zc (j = 0,1,2; m = 0,1,2 → [z0,z1,z2])
     # FLAT: [z_00,z_01,z_02,  z_10,z_11,z_12,  z_20,z_21,z_22]
-    z_from_size.zc: [0.0, 0.0, 0.0,   0.0, 0.0, 0.0,   0.0, 0.0, 0.0]
+    z_from_size.zc: [-43.05, -1672.76, -21283.31,
+                     -1851.96, -21261.35, 22066.89,
+                     -21246.92, 22066.95, -12031.19]
 
+    # limites de segurança para Z
     z_from_size.z_default: 0.0
     z_from_size.z_min: -10.0
     z_from_size.z_max: 10.0

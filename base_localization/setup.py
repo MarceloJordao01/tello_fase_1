@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'base_localization = base_localization.base_localization:main',
             'test_marker_pub = base_localization.test_marker_pub:main',
+            'calib_data_logger_posearray = base_localization.calib_data_logger_posearray:main',
         ],
     },
 )
