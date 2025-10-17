@@ -21,7 +21,11 @@ tello_navigator:
 
     # Cada item: "[dx, dy, dz, speed, delay_s]"
     waypoints_list:
-      - "[300, 400, 500, 100, 3.0]" # tf de teste para o base_localization
+      - "[500, 100, 500, 100, 3.0]" # tf de teste para o base_localization
+      - "[0, 400, 0, 100, 3.0]" # para a esquerda
+      - "[-400, 0, 0, 100, 3.0]" # para a tras
+      - "[0, -300, 0, 100, 3.0]" # para a tras
+
       # - "[85, 60, 260, 20, 3.0]" # primeira tf (1x,1y)
       # - "[160, 0, 0, 20, 4.0]" # casa 2x1y
       # - "[160, 0, 0, 20, 4.0]" # casa 3x1y
