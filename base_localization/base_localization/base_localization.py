@@ -95,14 +95,15 @@ class PolyBySize:
         return dx_corr, dy_corr
 
 
-# ---------------- Modelo de Z: somente função da diagonal ----------------
+# ---------------- Modelo de Z: usa o MESMO D0 do poly_size ----------------
 @dataclass
 class ZFromSize:
     """
     z' = Σ_j Z_j(ṼD)·(ṼD)^j, com Z_j(ṼD) = z_{j0} + z_{j1}·ṼD + z_{j2}·ṼD^2.
     - Apenas da diagonal (D) -> não depende de ΔX_raw/ΔY_raw.
+    - IMPORTANTE: D0 é herdado do poly_size.D0 (não existe z_from_size.D0 no YAML).
     """
-    D0: float = 300.0
+    D0: float  # herdado do PolyBySize.D0
     zc: List[Tuple[float, float, float]] = (
         (0.0, 0.0, 0.0),  # j=0
         (0.0, 0.0, 0.0),  # j=1
@@ -145,7 +146,7 @@ class BaseLocalizationNode(Node):
         * Se > 0 => faz TF (map <- target), computa P1 por bbox:
             - ΔX_raw = cx_ref - cx, ΔY_raw = cy_ref - cy   (MESMO padrão do calib)
             - correção polinomial por eixo (cada eixo usa seu Δ raw)
-            - z' apenas de D
+            - z' só de D (usando D0 = poly_size.D0)
             - P1 = origin_map + [Δx', Δy', z']   (sem k_gain)
           Desenha markers P0->P1 e APPEND em PoseArray acumulado.
       No retorno do serviço, imprime o vetor `base_link -> inferência` para cada bbox.
@@ -189,8 +190,8 @@ class BaseLocalizationNode(Node):
         self.declare_parameter("poly_size.ax", [0.0, 0.0, 0.0,   1.0, 0.0, 0.0,   0.0, 0.0, 0.0])
         self.declare_parameter("poly_size.ay", [0.0, 0.0, 0.0,   1.0, 0.0, 0.0,   0.0, 0.0, 0.0])
 
-        # --------------- z_from_size (por YAML: D0, zc, limites) ---------------
-        self.declare_parameter("z_from_size.D0", 300.0)
+        # --------------- z_from_size (sem D0 no YAML) ---------------
+        # Mantemos coeficientes/limites, mas **não** declaramos z_from_size.D0.
         self.declare_parameter("z_from_size.zc", [0.0, 0.0, 0.0,   0.0, 0.0, 0.0,   0.0, 0.0, 0.0])
         self.declare_parameter("z_from_size.z_default", 0.0)
         self.declare_parameter("z_from_size.z_min", -10.0)
@@ -254,8 +255,9 @@ class BaseLocalizationNode(Node):
             ax=self._parse_triplets(gp("poly_size.ax").double_array_value),
             ay=self._parse_triplets(gp("poly_size.ay").double_array_value),
         )
+        # OBS: ZFromSize agora **usa o mesmo D0** do poly_size (sem ler do YAML).
         self.z_from_size = ZFromSize(
-            D0=float(gp("z_from_size.D0").double_value),
+            D0=self.poly_size.D0,
             zc=self._parse_triplets(gp("z_from_size.zc").double_array_value),
             z_default=float(gp("z_from_size.z_default").double_value),
             z_min=float(gp("z_from_size.z_min").double_value),
@@ -286,7 +288,7 @@ class BaseLocalizationNode(Node):
             f"  cy_ref(read)    : {self.cy_ref:.1f}\n"
             f"  poses_topic     : {self.poses_topic}\n"
             f"  poly_size D0    : {self.poly_size.D0}\n"
-            f"  z_from_size D0  : {self.z_from_size.D0}"
+            f"  z_from_size D0  : (usa poly_size.D0)"
         )
         try:
             resolved_update = self.update_markers_srv.srv_name  # type: ignore[attr-defined]
@@ -338,7 +340,7 @@ class BaseLocalizationNode(Node):
         - TF lookup (map <- target_frame) -> origin_map
         - (cx,cy,w,h), deltas DIRETOS: ΔX_raw = cx_ref - cx, ΔY_raw = cy_ref - cy
         - correção polinomial por eixo -> (Δx',Δy')
-        - z' só de D
+        - z' só de D (usa D0 = poly_size.D0)
         - P1 = origin_map + [Δx', Δy', z']   (sem k_gain)
         """
         try:
@@ -367,10 +369,10 @@ class BaseLocalizationNode(Node):
         dx_corr, dy_corr = self.poly_size.apply(dx_raw, dy_raw, w, h)
         z_corr = self.z_from_size.apply(w, h)
 
-        # Sem k_gain: usa diretamente os valores corrigidos
-        vx = dx_corr
-        vy = dy_corr
-        return Point(x=float(origin_map.x + vx), y=float(origin_map.y + vy), z=float(z_corr))
+        # precisa da inversao pelos eixos (do mundo e da imagem)
+        vx = dy_corr
+        vy = dx_corr
+        return Point(x=float(origin_map.x + vx), y=float(origin_map.y + vy), z=float(origin_map.z + z_corr))
 
     # ---------------- Serviços ----------------
     def _srv_update_markers(self, request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:

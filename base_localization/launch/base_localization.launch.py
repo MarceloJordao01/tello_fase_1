@@ -29,12 +29,6 @@ def generate_launch_description():
         output='screen',
         emulate_tty=True,
         parameters=[LaunchConfiguration('params_file')],
-        # remappings opcionais (se quiser forçar por launch em vez de YAML):
-        # remappings=[
-        #     ('/base_detection/detected_coords', '/meu_topico/de_deteccao'),
-        #     ('/base_detection/num_bases', '/meu_topico/num_bases'),
-        #     ('/base_localization/poses', '/minha_saida/poses'),
-        # ]
     )
 
     return LaunchDescription([
